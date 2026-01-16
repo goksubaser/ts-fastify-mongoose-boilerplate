@@ -1,0 +1,112 @@
+import fastifyEnv from "@fastify/env";
+import Mongoose from "mongoose";
+import fastifyStatic from "@fastify/static";
+import path from "path";
+import { glob } from "glob";
+import { getOptions } from "./config";
+import { FastifyServer } from "./interface/server";
+import { Route } from "./interface/route";
+import { decorateManagers } from "./ioc";
+
+import { healthCheck } from "./routes/health-check";
+import { staticRoutes } from "./routes/static";
+
+async function connectWithRetry(dbUrl: string): Promise<typeof Mongoose> {
+  const maxRetries = 10;
+  let retries = 0;
+
+  while (retries < maxRetries) {
+    try {
+      return await Mongoose.connect(dbUrl);
+    } catch (err) {
+      retries++;
+      console.error(
+        `Failed to connect to mongo (attempt ${retries}/${maxRetries}) - retrying in 5 sec`,
+        err
+      );
+      if (retries >= maxRetries) {
+        throw new Error("Failed to connect to MongoDB after maximum retries");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+  }
+  throw new Error("Failed to connect to MongoDB");
+}
+
+async function getDomainRoutes(): Promise<Array<string>> {
+  return glob(path.join(__dirname, "./domain/*/route.*"));
+}
+
+export class Application {
+  constructor(private readonly server: FastifyServer) {}
+
+  private async registerDecorators() {
+    await decorateManagers(this.server);
+    this.server.decorate("upAndRunning", true);
+  }
+
+  private async registerPlugins() {
+    this.server.register(fastifyEnv, getOptions()).ready((err) => {
+      if (err) {
+        this.server.log.error({
+          message: err,
+        });
+        process.exit(1);
+      }
+      this.server.log.info({
+        msg: "Configuration loaded",
+        config: this.server.config,
+      });
+    });
+    this.server.register(fastifyStatic, {
+      root: path.join(__dirname, "../public"),
+      serve: false,
+    });
+  }
+
+  private async registerRoutes() {
+    const domainPaths = await getDomainRoutes();
+    const domainRoutes: Array<Route> = [];
+    for (let i = 0; i < domainPaths.length; i++) {
+      domainRoutes.push((await import(domainPaths[i])).default);
+    }
+    const routes: Array<Route> = [
+      healthCheck,
+      staticRoutes,
+      // TODO: Uncomment this when the domain routes are ready
+      // ...domainRoutes,
+    ];
+    routes.forEach((route) => route(this.server));
+  }
+
+  private async connect(): Promise<typeof Mongoose> {
+    const dbUrl = this.server.config.DB_URL;
+    return connectWithRetry(dbUrl);
+  }
+
+  public async disconnect() {
+    await Mongoose.disconnect();
+  }
+
+  public async init() {
+    await this.registerRoutes();
+    this.server.log.info("registered routes");
+    await this.registerDecorators();
+    this.server.log.info("registered decorators");
+    await this.registerPlugins();
+    this.server.log.info("registered plugins");
+    await this.server.ready();
+    await this.connect();
+    this.server.log.info("connected to db");
+  }
+
+  public async run() {
+    try {
+      await this.server.listen({ port: 5052, host: "0.0.0.0" });
+    } catch (err) {
+      await this.disconnect();
+      console.error(err);
+      process.exit(1);
+    }
+  }
+}
